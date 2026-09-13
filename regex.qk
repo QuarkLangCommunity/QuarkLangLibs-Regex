@@ -1,0 +1,987 @@
+/* QuarkLang 官方库：regex —— 正则表达式引擎（纯 qk 实现，零依赖、跨系统）
+ *
+ * 特性：字面量 / . / 转义（\d \D \w \W \s \S \n \t \r 与转义元字符）/
+ *       字符类 [abc] [^a-z0-9] / 量词 * + ? {m} {m,} {m,n}（含惰性 ? 后缀）/
+ *       分组 (…) 与非捕获 (?:…) / 交替 | / 锚点 ^ $ / 词边界 \b \B
+ * 不支持：反向引用 \1、前后瞻 (?=)、内联标志 (?i)、多行模式（^ $ 只匹配串首尾）
+ *
+ * API（space 前缀 regex::）：
+ *   regex::isValid(pat) bool
+ *   regex::isMatch(pat, s) bool          锚定串首（同 Python re.match）
+ *   regex::fullMatch(pat, s) bool        全串匹配（同 Python re.fullmatch）
+ *   regex::search(pat, s) bool           任意位置
+ *   regex::find(pat, s) String           首个匹配文本（无 → ""）
+ *   regex::findAll(pat, s) List<String>  全部非重叠匹配
+ *   regex::groups(pat, s) List<String>   [整体, 组1, 组2, …]（未参与 → ""）
+ *   regex::replace(pat, s, repl) String  全部替换；repl 支持 $0..$9 组引用与 $$ 字面量
+ *   regex::split(pat, s) List<String>
+ *   regex::escape(s) String              转义元字符（拼模式用）
+ *
+ * 对象式（同一模式重复使用更快，只编译一次）：
+ *   Regex re = regex::compile("(\\w+)@(\\w+)");
+ *   re.replace(s, "$2/$1")   re.isMatch(s)   re.fullMatch(s)   re.findAll(s)
+ *   re.findGroups(s)   re.split(s)   re.indexOf(s)（rune 下标）   re.groupCount()
+ *
+ * 说明：无效模式不抛异常，Regex::isValid()/regex::isValid() 返回 false，匹配一律失败。
+ */
+program library;
+
+// ===================== 指令 =====================
+// 0 CHAR   ch=字面字符           1 ANY   .（除换行）
+// 2 CLASS  parts=成对 lo/hi      3 NCLASS parts=成对 lo/hi（取反）
+// 4 BOL    ^                     5 EOL   $
+// 6 WORDB  \b                    7 NWORDB \B
+// 8 SPLIT  a=首选 b=次选          9 JMP   a=目标
+// 10 SAVE  a=槽位(2g / 2g+1)      11 MATCH
+struct {
+    op int;
+    a int;
+    b int;
+    ch String;
+    parts List<String>;
+} Inst;
+
+impl {
+    fn make(op int) Inst {
+        i Inst;
+        i.op = op; i.a = -1; i.b = -1; i.ch = ""; i.parts = [];
+        return i;
+    }
+    fn chr(c String) Inst {
+        i Inst = Inst::make(0);
+        i.ch = c;
+        return i;
+    }
+    fn cls(parts List<String>, neg int) Inst {
+        i Inst = Inst::make(2);
+        if (neg == 1) { i.op = 3; }
+        i.parts = parts;
+        return i;
+    }
+    // \d：0-9
+    fn digitSet() List<String> { return ["0", "9"]; }
+    // \w：0-9 A-Z a-z _
+    fn wordSet() List<String> { return ["0", "9", "A", "Z", "a", "z", "_", "_"]; }
+    // \s：\\t-\\r（制表/换行/垂直制表/换页/回车）+ 空格
+    fn spaceSet() List<String> { return ["\t", "\r", " ", " "]; }
+} Inst;
+
+// ===================== 代码片段 =====================
+// 线性程序中的一段：start=入口；jmp=出口占位 JMP（由上层补丁指向后继）
+struct { start int; jmp int; } Frag;
+impl {
+    fn make(s int, j int) Frag { f Frag; f.start = s; f.jmp = j; return f; }
+} Frag;
+
+// ===================== 匹配跨度 =====================
+struct { start int; end int; } Span;
+impl {
+    fn make(s int, e int) Span { p Span; p.start = s; p.end = e; return p; }
+    fn found(self) bool { return self.start >= 0; }
+} Span;
+
+// ===================== 模式编译 =====================
+struct {
+    pat String;
+    pos int;
+    n int;
+    prog List<Inst>;
+    ngroups int;
+    err String;
+} Parser;
+
+impl {
+    fn new(pat String) Parser {
+        p Parser;
+        p.pat = pat; p.pos = 0; p.n = pat.size(); p.prog = []; p.ngroups = 0; p.err = "";
+        return p;
+    }
+    fn eof(self) bool { return self.pos >= self.n; }
+    fn peek(self) String { if (self.pos >= self.n) { return ""; } return self.pat.charAt(self.pos); }
+    fn take(self) String { c String = self.peek(); self.pos = self.pos + 1; return c; }
+    fn emit(self, i Inst) int { self.prog.append(i); return self.prog.size() - 1; }
+    fn hole(self) int { return self.emit(Inst::make(9)); }
+    fn one(self, i Inst) Frag { s int = self.emit(i); h int = self.hole(); return Frag::make(s, h); }
+    fn patch(self, idx int, target int) int {
+        if (idx >= 0 && idx < self.prog.size()) { self.prog[idx].a = target; }
+        return 0;
+    }
+    fn isDigitC(self, c String) bool { return c.size() == 1 && c >= "0" && c <= "9"; }
+
+    // 编译入口
+    fn compile(self) Regex {
+        s0 int = self.emit(Inst::make(10));
+        self.prog[s0].a = 0;
+        j int = self.hole();
+        f Frag = self.parseExpr();
+        self.patch(j, f.start);
+        s1 int = self.emit(Inst::make(10));
+        self.prog[s1].a = 1;
+        self.patch(f.jmp, s1);
+        self.emit(Inst::make(11));
+        r Regex;
+        r.prog = self.prog;
+        r.ngroups = self.ngroups;
+        r.pattern = self.pat;
+        r.err = self.err;
+        r.isLit = self.litPattern(self.pat);
+        r.literal = self.pat;
+        r.entry = s0;
+        r.firstMode = 0;
+        r.firstParts = [];
+        r.prefix = "";
+        r.leadMode = 0;
+        r.leadOp = 0;
+        r.leadCh = "";
+        r.leadParts = [];
+        r.leadSet = "";
+        r = self.computeFirst(r);
+        r = self.computePrefix(r);
+        r = self.computeLead(r);
+        return r;
+    }
+    // 起点加速：模式以"同类字符循环"（X+ / X*）开头时，
+    // 若起点 sp 的前一个字符也属于 X，则更左的起点必然也能匹配 —— 跳过该起点不影响最左匹配语义。
+    fn computeLead(self, re Regex) Regex {
+        pc int = re.entry;
+        g int = 0;
+        while (g < 100) {
+            g = g + 1;
+            if (pc < 0 || pc >= re.prog.size()) { return re; }
+            op int = re.prog[pc].op;
+            if (op == 10) { pc = pc + 1; }
+            else if (op == 9) { pc = re.prog[pc].a; }
+            else if (op == 0 || op == 1 || op == 2 || op == 3) {   // X+ 形状：消费指令 + 同类循环回边（X* 可空匹配，不可跳过）
+                nx int = self.followJmp(re, pc + 1);
+                if (nx < 0 || re.prog[nx].op != 8) { return re; }
+                tb int = self.followJmp(re, re.prog[nx].a);
+                if (tb < 0 || tb >= re.prog.size()) { return re; }
+                if (!self.sameConsume(re, pc, tb)) { return re; }
+                if (!self.loopsTo(re, tb, nx)) { return re; }
+                return self.setLead(re, pc);
+            }
+            else { return re; }
+        }
+        return re;
+    }
+    fn setLead(self, re Regex, i int) Regex {
+        re.leadMode = 1;
+        re.leadOp = re.prog[i].op;
+        re.leadCh = re.prog[i].ch;
+        re.leadParts = re.prog[i].parts;
+        re.leadSet = "";
+        if (re.leadOp == 2) {                                  // 常见类展开为字符表，contains 一步判定
+            if (self.sameParts(re.leadParts, Inst::digitSet())) { re.leadSet = "0123456789"; }
+            else if (self.sameParts(re.leadParts, Inst::wordSet())) { re.leadSet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"; }
+            else if (self.sameParts(re.leadParts, Inst::spaceSet())) { re.leadSet = " \t\n\r"; }
+        }
+        return re;
+    }
+    fn followJmp(self, re Regex, pc int) int {
+        g int = 0;
+        while (g < 100) {
+            g = g + 1;
+            if (pc < 0 || pc >= re.prog.size()) { return -1; }
+            if (re.prog[pc].op != 9) { return pc; }
+            pc = re.prog[pc].a;
+        }
+        return -1;
+    }
+    fn sameConsume(self, re Regex, i int, j int) bool {
+        if (i < 0 || j < 0 || i >= re.prog.size() || j >= re.prog.size()) { return false; }
+        if (re.prog[i].op != re.prog[j].op) { return false; }
+        if (re.prog[i].op == 0) { return re.prog[i].ch == re.prog[j].ch; }
+        if (re.prog[i].op == 1) { return true; }
+        return self.sameParts(re.prog[i].parts, re.prog[j].parts);
+    }
+    fn sameParts(self, a List<String>, b List<String>) bool {
+        if (a.size() != b.size()) { return false; }
+        i int = 0;
+        while (i < a.size()) { if (a[i] != b[i]) { return false; } i = i + 1; }
+        return true;
+    }
+    fn loopsTo(self, re Regex, t int, split int) bool {
+        pc int = self.followJmp(re, t + 1);
+        g int = 0;
+        while (g < 20) {
+            g = g + 1;
+            if (pc < 0) { return false; }
+            if (pc == split) { return true; }
+            if (re.prog[pc].op == 9) { pc = re.prog[pc].a; }
+            else if (re.prog[pc].op == 10) { pc = pc + 1; }
+            else { return false; }
+        }
+        return false;
+    }
+    // 首字符过滤集：从入口沿 SAVE/断言 前进，取第一个消费字符的指令
+    fn computeFirst(self, re Regex) Regex {
+        parts List<String> = [];
+        mode int = 0;
+        pc int = re.entry;
+        guard int = 0;
+        while (guard < 100) {
+            guard = guard + 1;
+            if (pc < 0 || pc >= re.prog.size()) { mode = 0; break; }
+            ins Inst = re.prog[pc];
+            if (ins.op == 11) { mode = 0; break; }                       // MATCH：可空
+            if (ins.op == 10) { pc = pc + 1; }
+            else if (ins.op == 9) { pc = ins.a; }
+            else if (ins.op == 4 || ins.op == 6 || ins.op == 7) { pc = pc + 1; }
+            else if (ins.op == 0) { mode = 1; parts.append(ins.ch); parts.append(ins.ch); break; }
+            else if (ins.op == 2) { mode = 1; self.addRanges(parts, ins.parts); break; }
+            else if (ins.op == 3) { mode = 2; self.addRanges(parts, ins.parts); break; }
+            else { mode = 0; break; }                                    // SPLIT / ANY：不过滤
+        }
+        re.firstMode = mode;
+        re.firstParts = parts;
+        return re;
+    }
+    // 入口字面前缀：SAVE0/JMP/CHAR 链
+    fn computePrefix(self, re Regex) Regex {
+        p String = "";
+        pc int = re.entry;
+        guard int = 0;
+        while (guard < 1000) {
+            guard = guard + 1;
+            if (pc < 0 || pc >= re.prog.size()) { break; }
+            ins Inst = re.prog[pc];
+            if (ins.op == 10) { pc = pc + 1; }
+            else if (ins.op == 9) { pc = ins.a; }
+            else if (ins.op == 0) { p = p + ins.ch; pc = pc + 1; }
+            else { break; }
+        }
+        re.prefix = p;
+        return re;
+    }
+    fn litPattern(self, pat String) int {
+        i int = 0;
+        while (i < pat.size()) {
+            if (Regex::isMetaChar(pat.charAt(i))) { return 0; }
+            i = i + 1;
+        }
+        return 1;
+    }
+
+    // 交替：concat ('|' concat)*（右结合递归）
+    // 入口先放占位 JMP，最终指向 SPLIT —— 避免上层落入分支死代码
+    fn parseExpr(self) Frag {
+        e int = self.hole();
+        f Frag = self.parseConcat();
+        if (self.peek() != "|") {
+            self.patch(e, f.start);
+            return Frag::make(e, f.jmp);
+        }
+        self.take();
+        g Frag = self.parseExpr();
+        sp int = self.emit(Inst::make(8));
+        self.prog[sp].a = f.start;
+        self.prog[sp].b = g.start;
+        h int = self.hole();
+        self.patch(f.jmp, h);
+        self.patch(g.jmp, h);
+        self.patch(e, sp);
+        return Frag::make(e, h);
+    }
+
+    // 连接：repeat+
+    fn parseConcat(self) Frag {
+        c String = self.peek();
+        if (c == "" || c == "|" || c == ")") { h0 int = self.hole(); return Frag::make(h0, h0); }
+        f Frag = self.parseRepeat();
+        while (true) {
+            c = self.peek();
+            if (c == "" || c == "|" || c == ")") { break; }
+            nx Frag = self.parseRepeat();
+            self.patch(f.jmp, nx.start);
+            f.jmp = nx.jmp;
+        }
+        return f;
+    }
+
+    // 重复：atom 量词?
+    fn parseRepeat(self) Frag {
+        from int = self.pos;
+        pre int = self.ngroups;
+        base Frag = self.parseAtom();
+        to int = self.pos;
+        c String = self.peek();
+        lo int = -1;
+        hi int = -1;
+        if (c == "*") { self.take(); lo = 0; hi = -1; }
+        else if (c == "+") { self.take(); lo = 1; hi = -1; }
+        else if (c == "?") { self.take(); lo = 0; hi = 1; }
+        else if (c == "{") {
+            out List<int> = [0, 0];
+            ok int = self.parseBounds(out);
+            if (ok == 1) { lo = out[0]; hi = out[1]; }
+        }
+        if (lo < 0) { return base; }
+        lazy int = 0;
+        if (self.peek() == "?") { self.take(); lazy = 1; }
+        return self.build(from, to, pre, base, lo, hi, lazy);
+    }
+
+    // {m} {m,} {m,n}；成功 1，失败 0（调用方回退为字面量）
+    fn parseBounds(self, out List<int>) int {
+        save int = self.pos;
+        self.take();
+        m int = self.readNum();
+        if (m < 0) { self.pos = save; return 0; }
+        n int = m;
+        if (self.peek() == ",") {
+            self.take();
+            if (self.peek() == "}") { n = -1; }
+            else {
+                n = self.readNum();
+                if (n < 0) { self.pos = save; return 0; }
+            }
+        }
+        if (self.peek() != "}") { self.pos = save; return 0; }
+        self.take();
+        if (n >= 0 && n < m) { self.err = "invalid repetition range"; self.pos = save; return 0; }
+        out[0] = m; out[1] = n;
+        return 1;
+    }
+    fn readNum(self) int {
+        v int = 0;
+        got int = 0;
+        while (true) {
+            c String = self.peek();
+            if (!self.isDigitC(c)) { break; }
+            v = v * 10 + "0123456789".indexOf(c);
+            self.take();
+            got = got + 1;
+            if (v > 100000) { break; }
+        }
+        if (got == 0) { return -1; }
+        return v;
+    }
+
+    // 组装重复：必选 lo 份 + （无上限：星号 / 有限：可选 hi-lo 份）
+    fn build(self, from int, to int, pre int, base Frag, lo int, hi int, lazy int) Frag {
+        if (hi == 0) { h0 int = self.hole(); return Frag::make(h0, h0); }
+        head int = -1;
+        tail Frag = base;
+        if (lo >= 1) {
+            head = base.start;
+            made int = 1;
+            while (made < lo) {
+                nx Frag = self.reparse(from, to, pre);
+                self.patch(tail.jmp, nx.start);
+                tail = nx;
+                made = made + 1;
+            }
+        }
+        if (hi < 0) {
+            st Frag = self.star(from, to, pre, lazy);
+            if (head < 0) { head = st.start; }
+            else { self.patch(tail.jmp, st.start); }
+            tail = st;
+        } else {
+            k int = hi - lo;
+            if (k > 1000) { k = 1000; self.err = "repetition too large"; }
+            i int = 0;
+            while (i < k) {
+                op Frag = self.opt(from, to, pre, lazy);
+                if (head < 0) { head = op.start; }
+                else { self.patch(tail.jmp, op.start); }
+                tail = op;
+                i = i + 1;
+            }
+        }
+        if (head < 0) { hz int = self.hole(); return Frag::make(hz, hz); }
+        return Frag::make(head, tail.jmp);
+    }
+
+    // 星号：L: SPLIT(body|hole)
+    fn star(self, from int, to int, pre int, lazy int) Frag {
+        L int = self.emit(Inst::make(8));
+        body Frag = self.reparse(from, to, pre);
+        h int = self.hole();
+        if (lazy == 1) { self.prog[L].a = h; self.prog[L].b = body.start; }
+        else { self.prog[L].a = body.start; self.prog[L].b = h; }
+        self.patch(body.jmp, L);
+        return Frag::make(L, h);
+    }
+    // 可选：SPLIT(body|hole)
+    fn opt(self, from int, to int, pre int, lazy int) Frag {
+        body Frag = self.reparse(from, to, pre);
+        sp int = self.emit(Inst::make(8));
+        h int = self.hole();
+        if (lazy == 1) { self.prog[sp].a = h; self.prog[sp].b = body.start; }
+        else { self.prog[sp].a = body.start; self.prog[sp].b = h; }
+        self.patch(body.jmp, h);
+        return Frag::make(sp, h);
+    }
+    // 重新解析 [from,to) 的原子（组号从 pre 重新分配，保证捕获语义=最后一次迭代）
+    fn reparse(self, from int, to int, pre int) Frag {
+        sp int = self.pos; sn int = self.n; sg int = self.ngroups;
+        self.pos = from; self.n = to; self.ngroups = pre;
+        f Frag = self.parseAtom();
+        self.pos = sp; self.n = sn; self.ngroups = sg;
+        return f;
+    }
+
+    // 入口跳转包裹：把原子代码放在占位 JMP 之后，避免上层落入死代码
+    fn parseAtom(self) Frag {
+        e int = self.hole();
+        f Frag = self.parseAtomCode();
+        self.patch(e, f.start);
+        return Frag::make(e, f.jmp);
+    }
+    fn parseAtomCode(self) Frag {
+        c String = self.peek();
+        if (c == "") { h0 int = self.hole(); return Frag::make(h0, h0); }
+        if (c == "(") { return self.parseGroup(); }
+        if (c == "[") { return self.parseClass(); }
+        if (c == ".") { self.take(); return self.one(Inst::make(1)); }
+        if (c == "^") { self.take(); return self.one(Inst::make(4)); }
+        if (c == "$") { self.take(); return self.one(Inst::make(5)); }
+        if (c == "\\") { return self.parseEscape(); }
+        if (c == "*" || c == "+" || c == "?") {
+            self.err = "nothing to repeat";
+            self.take();
+            h1 int = self.hole();
+            return Frag::make(h1, h1);
+        }
+        self.take();
+        return self.one(Inst::chr(c));
+    }
+
+    // 分组：(…) 捕获 / (?:…) 非捕获
+    fn parseGroup(self) Frag {
+        self.take();
+        cap int = 1;
+        if (self.peek() == "?") {
+            self.take();
+            if (self.peek() == ":") { self.take(); cap = 0; }
+            else { self.err = "unsupported (?...) syntax"; }
+        }
+        g int = 0;
+        s0 int = -1;
+        if (cap == 1) {
+            self.ngroups = self.ngroups + 1;
+            g = self.ngroups;
+            s0 = self.emit(Inst::make(10));
+            self.prog[s0].a = 2 * g;
+        }
+        inner Frag = self.parseExpr();
+        if (self.peek() == ")") { self.take(); }
+        else { self.err = "missing )"; }
+        if (cap == 1) {
+            s1 int = self.emit(Inst::make(10));
+            self.prog[s1].a = 2 * g + 1;
+            self.patch(inner.jmp, s1);
+            ex int = self.hole();
+            return Frag::make(s0, ex);
+        }
+        ex0 int = self.hole();
+        self.patch(inner.jmp, ex0);
+        return Frag::make(inner.start, ex0);
+    }
+
+    fn parseEscape(self) Frag {
+        self.take();
+        e String = self.take();
+        if (e == "d") { return self.one(Inst::cls(Inst::digitSet(), 0)); }
+        if (e == "D") { return self.one(Inst::cls(Inst::digitSet(), 1)); }
+        if (e == "w") { return self.one(Inst::cls(Inst::wordSet(), 0)); }
+        if (e == "W") { return self.one(Inst::cls(Inst::wordSet(), 1)); }
+        if (e == "s") { return self.one(Inst::cls(Inst::spaceSet(), 0)); }
+        if (e == "S") { return self.one(Inst::cls(Inst::spaceSet(), 1)); }
+        if (e == "b") { return self.one(Inst::make(6)); }
+        if (e == "B") { return self.one(Inst::make(7)); }
+        if (e == "n") { return self.one(Inst::chr("\n")); }
+        if (e == "t") { return self.one(Inst::chr("\t")); }
+        if (e == "r") { return self.one(Inst::chr("\r")); }
+        if (self.isDigitC(e)) { self.err = "backreference unsupported"; return self.one(Inst::chr(e)); }
+        if (e == "") {
+            self.err = "trailing backslash";
+            h0 int = self.hole();
+            return Frag::make(h0, h0);
+        }
+        return self.one(Inst::chr(e));
+    }
+
+    // 字符类：[…] / [^…]
+    fn parseClass(self) Frag {
+        self.take();
+        neg int = 0;
+        if (self.peek() == "^") { self.take(); neg = 1; }
+        parts List<String> = [];
+        first bool = true;
+        while (true) {
+            if (self.eof()) { self.err = "missing ]"; break; }
+            c String = self.peek();
+            if (c == "]" && !first) { self.take(); break; }
+            if (c == "\\") {
+                self.take();
+                e String = self.take();
+                if (e == "d") { self.addRanges(parts, Inst::digitSet()); }
+                else if (e == "w") { self.addRanges(parts, Inst::wordSet()); }
+                else if (e == "s") { self.addRanges(parts, Inst::spaceSet()); }
+                else if (e == "D" || e == "W" || e == "S") { self.err = "negated class escape in [] unsupported"; }
+                else { self.addRangeOrChar(parts, self.unescape(e)); }
+                first = false;
+            } else {
+                self.take();
+                self.addRangeOrChar(parts, c);
+                first = false;
+            }
+        }
+        return self.one(Inst::cls(parts, neg));
+    }
+    fn addRangeOrChar(self, parts List<String>, lo String) int {
+        if (self.peek() == "-" && self.pos + 1 < self.n && self.pat.charAt(self.pos + 1) != "]") {
+            self.take();
+            hi String = self.unescape(self.take());
+            parts.append(lo);
+            parts.append(hi);
+            return 0;
+        }
+        parts.append(lo);
+        parts.append(lo);
+        return 0;
+    }
+    fn unescape(self, e String) String {
+        if (e == "n") { return "\n"; }
+        if (e == "t") { return "\t"; }
+        if (e == "r") { return "\r"; }
+        return e;
+    }
+    fn addRanges(self, parts List<String>, rs List<String>) int {
+        i int = 0;
+        while (i + 1 < rs.size()) {
+            parts.append(rs[i]);
+            parts.append(rs[i + 1]);
+            i = i + 2;
+        }
+        return 0;
+    }
+} Parser;
+
+// ===================== 编译后的正则 =====================
+struct {
+    prog List<Inst>;
+    ngroups int;
+    pattern String;
+    err String;
+    isLit int;
+    literal String;
+    entry int;
+    firstMode int;              // 0=不过滤 1=首字符必须属于 firstParts 2=必须不属于
+    firstParts List<String>;
+    prefix String;              // 入口字面前缀（用于跳跃候选起点）
+    leadMode int;               // 1=模式以同类字符循环（X+）开头，可跳过"前一个字符也属同类"的起点
+    leadOp int;                 // 循环原子指令（0 CHAR / 1 ANY / 2 CLASS / 3 NCLASS）
+    leadCh String;
+    leadParts List<String>;
+    leadSet String;             // 常见类（\d \w \s）展开的字符表，命中最快路径
+} Regex;
+
+impl {
+    fn new(pattern String) Regex {
+        p Parser = Parser::new(pattern);
+        return p.compile();
+    }
+    fn inSet(c String, rs List<String>) bool {
+        i int = 0;
+        while (i + 1 < rs.size()) {
+            if (c >= rs[i] && c <= rs[i + 1]) { return true; }
+            i = i + 2;
+        }
+        return false;
+    }
+    // 起点加速判定：c 是否属于"同类循环"的字符集
+    fn leadHas(self, c String) bool {
+        if (self.leadOp == 0) { return c == self.leadCh; }
+        if (self.leadOp == 1) { return c != "\n"; }
+        if (self.leadOp == 2) { return Regex::inSet(c, self.leadParts); }
+        return !Regex::inSet(c, self.leadParts);
+    }
+    fn isMetaChar(c String) bool {
+        if (c == "\\") { return true; }
+        if (c == "." || c == "^" || c == "$" || c == "|") { return true; }
+        if (c == "?" || c == "*" || c == "+") { return true; }
+        if (c == "(" || c == ")" || c == "[" || c == "]") { return true; }
+        if (c == "{" || c == "}") { return true; }
+        return false;
+    }
+    fn isValid(self) bool { return self.err == ""; }
+    fn error(self) String { return self.err; }
+    fn source(self) String { return self.pattern; }
+    fn groupCount(self) int { return self.ngroups; }
+    fn isDigitC(self, c String) bool { return c.size() == 1 && c >= "0" && c <= "9"; }
+    // 反汇编（诊断/教学）：打印指令序列
+    fn disasm(self) String {
+        out String = "lit=" + self.isLit.toString() + " n=" + self.prog.size().toString() + " g=" + self.ngroups.toString() + " err=[" + self.err + "]";
+        i int = 0;
+        while (i < self.prog.size()) {
+            ins Inst = self.prog[i];
+            out = out + " | " + i.toString() + ":" + ins.op.toString() + "," + ins.a.toString() + "," + ins.b.toString();
+            i = i + 1;
+        }
+        return out;
+    }
+
+    fn freshCaps(self) List<int> {
+        c List<int> = [];
+        i int = 0;
+        while (i < 2 * (self.ngroups + 1)) { c.append(-1); i = i + 1; }
+        return c;
+    }
+    // 锚定在 at 处尝试一次
+    fn execAt(self, s String, at int, caps List<int>) Span {
+        if (self.isLit == 1) {
+            m int = self.literal.size();
+            if (at >= 0 && at + m <= s.size() && s.substring(at, at + m) == self.literal) {
+                caps[0] = at; caps[1] = at + m;
+                return Span::make(at, at + m);
+            }
+            return Span::make(-1, -1);
+        }
+        mt Matcher = Matcher::new(self.prog, s, self.ngroups);
+        e int = mt.run(self.entry, at);
+        if (e < 0) { return Span::make(-1, -1); }
+        k int = 0;
+        while (k < caps.size()) { caps[k] = mt.caps[k]; k = k + 1; }
+        return Span::make(at, e);
+    }
+    // 从 from 起最左匹配
+    fn execFrom(self, s String, from int, caps List<int>) Span {
+        if (self.isLit == 1) {
+            i int = self.litIndex(s, self.literal, from);
+            if (i < 0) { return Span::make(-1, -1); }
+            caps[0] = i; caps[1] = i + self.literal.size();
+            return Span::make(i, i + self.literal.size());
+        }
+        n int = s.size();
+        sp int = from;
+        if (sp < 0) { sp = 0; }
+        mt Matcher = Matcher::new(self.prog, s, self.ngroups);
+        if (self.prefix.size() > 0) {                      // 字面前缀跳跃：只在前缀出现处尝试
+            cand int = self.litIndex(s, self.prefix, sp);
+            while (cand >= 0) {
+                mt.reset();
+                ep int = mt.run(self.entry, cand);
+                if (ep >= 0) {
+                    kp int = 0;
+                    while (kp < caps.size()) { caps[kp] = mt.caps[kp]; kp = kp + 1; }
+                    return Span::make(cand, ep);
+                }
+                cand = self.litIndex(s, self.prefix, cand + 1);
+            }
+            return Span::make(-1, -1);
+        }
+        while (sp <= n) {
+            okStart bool = true;
+            if (sp < n && self.firstMode != 0) {           // 首字符过滤：跳过不可能的起点
+                b bool = Regex::inSet(s.charAt(sp), self.firstParts);
+                if (self.firstMode == 1) { if (!b) { okStart = false; } }
+                else { if (b) { okStart = false; } }
+            }
+            if (okStart && sp > 0 && self.leadMode == 1) { // 同类循环起点加速
+                prev String = s.charAt(sp - 1);
+                if (self.leadSet.size() > 0) {
+                    if (self.leadSet.contains(prev)) { okStart = false; }
+                }
+                else {
+                    if (self.leadHas(prev)) { okStart = false; }
+                }
+            }
+            if (okStart) {
+                mt.reset();
+                e int = mt.run(self.entry, sp);
+                if (e >= 0) {
+                    k int = 0;
+                    while (k < caps.size()) { caps[k] = mt.caps[k]; k = k + 1; }
+                    return Span::make(sp, e);
+                }
+            }
+            sp = sp + 1;
+        }
+        return Span::make(-1, -1);
+    }
+    fn litIndex(self, s String, lit String, from int) int {
+        m int = lit.size();
+        n int = s.size();
+        if (m == 0) { if (from <= n) { return from; } return -1; }
+        i int = from;
+        if (i < 0) { i = 0; }
+        while (i + m <= n) {
+            j int = 0;
+            ok bool = true;
+            while (j < m) {
+                if (s.charAt(i + j) != lit.charAt(j)) { ok = false; break; }
+                j = j + 1;
+            }
+            if (ok) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // ===== 公开匹配 API =====
+    fn isMatch(self, s String) bool {
+        caps List<int> = self.freshCaps();
+        return self.execAt(s, 0, caps).found();
+    }
+    fn fullMatch(self, s String) bool {
+        caps List<int> = self.freshCaps();
+        sp Span = self.execAt(s, 0, caps);
+        return sp.found() && sp.end == s.size();
+    }
+    fn hasMatch(self, s String) bool {
+        caps List<int> = self.freshCaps();
+        return self.execFrom(s, 0, caps).found();
+    }
+    fn indexOf(self, s String) int {
+        caps List<int> = self.freshCaps();
+        return self.execFrom(s, 0, caps).start;
+    }
+    fn find(self, s String) String {
+        caps List<int> = self.freshCaps();
+        sp Span = self.execFrom(s, 0, caps);
+        if (!sp.found()) { return ""; }
+        return s.substring(sp.start, sp.end);
+    }
+    fn findAll(self, s String) List<String> {
+        out List<String> = [];
+        caps List<int> = self.freshCaps();
+        n int = s.size();
+        pos int = 0;
+        while (pos <= n) {
+            sp Span = self.execFrom(s, pos, caps);
+            if (!sp.found()) { break; }
+            out.append(s.substring(sp.start, sp.end));
+            if (sp.end > sp.start) { pos = sp.end; }
+            else { pos = sp.start + 1; }
+        }
+        return out;
+    }
+    // [整体, 组1, 组2, …]
+    fn findGroups(self, s String) List<String> {
+        out List<String> = [];
+        caps List<int> = self.freshCaps();
+        sp Span = self.execFrom(s, 0, caps);
+        if (!sp.found()) { return out; }
+        g int = 0;
+        while (g <= self.ngroups) {
+            out.append(self.groupText(s, caps, g));
+            g = g + 1;
+        }
+        return out;
+    }
+    fn groupText(self, s String, caps List<int>, g int) String {
+        if (2 * g + 1 >= caps.size()) { return ""; }
+        a int = caps[2 * g];
+        b int = caps[2 * g + 1];
+        if (a < 0 || b < a) { return ""; }
+        return s.substring(a, b);
+    }
+    fn replaceFirst(self, s String, repl String) String {
+        caps List<int> = self.freshCaps();
+        sp Span = self.execFrom(s, 0, caps);
+        if (!sp.found()) { return s; }
+        return s.substring(0, sp.start) + self.expand(s, repl, caps) + s.substring(sp.end);
+    }
+    fn replace(self, s String, repl String) String {
+        out String = "";
+        caps List<int> = self.freshCaps();
+        n int = s.size();
+        pos int = 0;
+        while (pos <= n) {
+            sp Span = self.execFrom(s, pos, caps);
+            if (!sp.found()) { break; }
+            out = out + s.substring(pos, sp.start) + self.expand(s, repl, caps);
+            if (sp.end > sp.start) { pos = sp.end; }
+            else {
+                if (sp.start < n) { out = out + s.charAt(sp.start); }
+                pos = sp.start + 1;
+            }
+        }
+        if (pos <= n) { out = out + s.substring(pos, n); }
+        return out;
+    }
+    fn expand(self, s String, repl String, caps List<int>) String {
+        out String = "";
+        i int = 0;
+        while (i < repl.size()) {
+            c String = repl.charAt(i);
+            if (c == "$" || c == "\\") {
+                d String = "";
+                if (i + 1 < repl.size()) { d = repl.charAt(i + 1); }
+                if (d == "$" || d == "\\") { out = out + d; i = i + 2; }
+                else if (self.isDigitC(d)) { out = out + self.groupText(s, caps, "0123456789".indexOf(d)); i = i + 2; }
+                else { out = out + c; i = i + 1; }
+            } else { out = out + c; i = i + 1; }
+        }
+        return out;
+    }
+    fn split(self, s String) List<String> {
+        out List<String> = [];
+        caps List<int> = self.freshCaps();
+        n int = s.size();
+        pos int = 0;
+        while (pos <= n) {
+            sp Span = self.execFrom(s, pos, caps);
+            if (!sp.found()) { break; }
+            out.append(s.substring(pos, sp.start));
+            if (sp.end > sp.start) { pos = sp.end; }
+            else {
+                if (sp.start < n) { out.append(s.charAt(sp.start)); }
+                pos = sp.start + 1;
+            }
+        }
+        if (pos <= n) { out.append(s.substring(pos, n)); }
+        return out;
+    }
+} Regex;
+
+// ===================== 回溯虚拟机 =====================
+struct {
+    prog List<Inst>;
+    input String;
+    n int;
+    caps List<int>;
+    gc int;             // 捕获组数
+    undo List<int>;     // 撤销日志：(槽位, 旧值) 序列，容量复用，避免每次 SPLIT 分配
+    undoLen int;        // 日志逻辑长度
+} Matcher;
+
+impl {
+    fn new(prog List<Inst>, input String, ngroups int) Matcher {
+        m Matcher;
+        m.prog = prog; m.input = input; m.n = input.size(); m.gc = ngroups;
+        c List<int> = [];
+        i int = 0;
+        while (i < 2 * (ngroups + 1)) { c.append(-1); i = i + 1; }
+        m.caps = c;
+        lg List<int> = [];
+        if (ngroups > 0) {                                // 只有捕获组才需要撤销日志
+            j int = 0;
+            while (j < 128) { lg.append(0); j = j + 1; }  // 预留容量，之后按需增长
+        }
+        m.undo = lg;
+        m.undoLen = 0;
+        return m;
+    }
+    fn reset(self) int {
+        i int = 0;
+        while (i < self.caps.size()) { self.caps[i] = -1; i = i + 1; }
+        self.undoLen = 0;
+        return 0;
+    }
+    fn isWordAt(self, i int) bool {
+        if (i < 0 || i >= self.n) { return false; }
+        return self.inSet(self.input.charAt(i), Inst::wordSet());
+    }
+    fn inSet(self, c String, rs List<String>) bool {
+        i int = 0;
+        while (i + 1 < rs.size()) {
+            if (c >= rs[i] && c <= rs[i + 1]) { return true; }
+            i = i + 2;
+        }
+        return false;
+    }
+
+    fn run(self, pc int, sp int) int {
+        if (pc < 0 || pc >= self.prog.size()) { return -1; }
+        ins Inst = self.prog[pc];
+        op int = ins.op;
+        if (op == 11) { return sp; }                                  // MATCH
+        if (op == 0) {                                                // CHAR
+            if (sp < self.n && self.input.charAt(sp) == ins.ch) { return self.run(pc + 1, sp + 1); }
+            return -1;
+        }
+        if (op == 1) {                                                // ANY
+            if (sp < self.n && self.input.charAt(sp) != "\n") { return self.run(pc + 1, sp + 1); }
+            return -1;
+        }
+        if (op == 2 || op == 3) {                                     // CLASS / NCLASS
+            if (sp < self.n) {
+                ok bool = self.inSet(self.input.charAt(sp), ins.parts);
+                if (op == 3) { ok = !ok; }
+                if (ok) { return self.run(pc + 1, sp + 1); }
+            }
+            return -1;
+        }
+        if (op == 4) {                                                // BOL
+            if (sp == 0) { return self.run(pc + 1, sp); }
+            return -1;
+        }
+        if (op == 5) {                                                // EOL
+            if (sp == self.n) { return self.run(pc + 1, sp); }
+            return -1;
+        }
+        if (op == 6 || op == 7) {                                     // WORDB / NWORDB
+            b bool = self.isWordAt(sp - 1) != self.isWordAt(sp);
+            if (op == 7) { b = !b; }
+            if (b) { return self.run(pc + 1, sp); }
+            return -1;
+        }
+        if (op == 8) {                                                // SPLIT
+            if (self.gc == 0) {                                       // 无捕获组：无需任何回滚
+                r0 int = self.run(ins.a, sp);
+                if (r0 >= 0) { return r0; }
+                return self.run(ins.b, sp);
+            }
+            mark int = self.undoLen;                                  // 撤销日志回滚（零分配）
+            r1 int = self.run(ins.a, sp);
+            if (r1 >= 0) { return r1; }
+            while (self.undoLen > mark) {
+                self.undoLen = self.undoLen - 2;
+                self.caps[self.undo[self.undoLen]] = self.undo[self.undoLen + 1];
+            }
+            r2 int = self.run(ins.b, sp);
+            if (r2 >= 0) { return r2; }
+            while (self.undoLen > mark) {
+                self.undoLen = self.undoLen - 2;
+                self.caps[self.undo[self.undoLen]] = self.undo[self.undoLen + 1];
+            }
+            return -1;
+        }
+        if (op == 9) { return self.run(ins.a, sp); }                  // JMP
+        if (op == 10) {                                               // SAVE
+            slot int = ins.a;
+            old int = self.caps[slot];
+            self.caps[slot] = sp;
+            if (self.gc > 0) {                                        // 无捕获组时无需记日志
+                if (self.undoLen + 1 >= self.undo.size()) {
+                    self.undo.append(0);
+                    self.undo.append(0);
+                }
+                self.undo[self.undoLen] = slot;
+                self.undo[self.undoLen + 1] = old;
+                self.undoLen = self.undoLen + 2;
+            }
+            return self.run(pc + 1, sp);
+        }
+        return -1;
+    }
+} Matcher;
+
+// ===================== 导出 API =====================
+space {
+    fn compile(pat String) Regex { return Regex::new(pat); }
+    fn isValid(pat String) bool { r Regex = Regex::new(pat); return r.isValid(); }
+    fn isMatch(pat String, s String) bool { r Regex = Regex::new(pat); return r.isMatch(s); }
+    fn fullMatch(pat String, s String) bool { r Regex = Regex::new(pat); return r.fullMatch(s); }
+    fn search(pat String, s String) bool { r Regex = Regex::new(pat); return r.hasMatch(s); }
+    fn find(pat String, s String) String { r Regex = Regex::new(pat); return r.find(s); }
+    fn findAll(pat String, s String) List<String> { r Regex = Regex::new(pat); return r.findAll(s); }
+    fn groups(pat String, s String) List<String> { r Regex = Regex::new(pat); return r.findGroups(s); }
+    fn replace(pat String, s String, repl String) String { r Regex = Regex::new(pat); return r.replace(s, repl); }
+    fn split(pat String, s String) List<String> { r Regex = Regex::new(pat); return r.split(s); }
+    fn escape(s String) String {
+        out String = "";
+        i int = 0;
+        while (i < s.size()) {
+            c String = s.charAt(i);
+            if (Regex::isMetaChar(c)) { out = out + "\\" + c; }
+            else { out = out + c; }
+            i = i + 1;
+        }
+        return out;
+    }
+} (regex);

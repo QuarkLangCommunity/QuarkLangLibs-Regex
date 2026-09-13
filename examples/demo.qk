@@ -1,0 +1,40 @@
+/* regex 库示例：日志解析
+ * 运行：把 regex.qk 放到本文件同目录，然后 quark demo.qk
+ */
+program main;
+import "regex";
+
+fn main(io IOStream) {
+    text String = "";
+    text = text + "[2026-09-13 08:00:01] INFO  user=alice ip=10.0.0.7 status=200\n";
+    text = text + "[2026-09-13 08:00:02] ERROR user=bob ip=10.0.0.9 status=500\n";
+    text = text + "[2026-09-13 08:00:03] INFO  user=carol ip=10.0.0.8 status=404\n";
+
+    // 1) 一次编译，多次复用
+    line Regex = regex::compile("^\\[(.*?)\\]\\s+(\\w+)\\s+user=(\\w+)\\s+ip=([0-9.]+)\\s+status=(\\d+)$");
+
+    lines List<String> = text.split("\n");
+    i int = 0;
+    io.println("== 全部请求 ==");
+    while (i < lines.size()) {
+        g List<String> = line.findGroups(lines[i]);
+        if (g.size() > 0) {
+            io.println(g[1] + " [" + g[2] + "] " + g[3] + "@" + g[4] + " -> " + g[5]);
+        }
+        i = i + 1;
+    }
+
+    // 2) 统计 ERROR 行数
+    io.println("== 统计 ==");
+    io.println("ERROR 行数 = " + regex::findAll("ERROR", text).size().toString());
+
+    // 3) 把 status=5xx 批量改写为 "SERVER_ERROR"
+    io.println("== 5xx 改写 ==");
+    io.println(regex::replace("status=5\\d\\d", text, "status=SERVER_ERROR"));
+
+    // 4) 抽取所有 IP
+    io.println("== IP 列表 ==");
+    ips List<String> = regex::findAll("\\d+\\.\\d+\\.\\d+\\.\\d+", text);
+    j int = 0;
+    while (j < ips.size()) { io.println("  " + ips[j]); j = j + 1; }
+}

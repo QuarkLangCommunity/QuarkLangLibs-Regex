@@ -1,0 +1,157 @@
+program main;
+import "regex";
+
+fn chkb(io IOStream, st List<int>, name String, got bool, want bool) int {
+    if (got == want) { return 0; }
+    st[0] = st[0] + 1;
+    io.println("FAIL " + name);
+    return 0;
+}
+fn chks(io IOStream, st List<int>, name String, got String, want String) int {
+    if (got == want) { return 0; }
+    st[0] = st[0] + 1;
+    io.println("FAIL " + name + " got=[" + got + "] want=[" + want + "]");
+    return 0;
+}
+fn chki(io IOStream, st List<int>, name String, got int, want int) int {
+    if (got == want) { return 0; }
+    st[0] = st[0] + 1;
+    io.println("FAIL " + name + " got=" + got.toString() + " want=" + want.toString());
+    return 0;
+}
+
+fn main(io IOStream) {
+    st List<int> = [0];
+
+    chkb(io, st, "valid-ok", regex::isValid("a(b)c"), true);
+    chkb(io, st, "valid-bad", regex::isValid("a(b"), false);
+    chkb(io, st, "valid-range", regex::isValid("a{2,1}"), false);
+    chkb(io, st, "valid-backref", regex::isValid("(a)\\1"), false);
+
+    chkb(io, st, "match-yes", regex::isMatch("abc", "abcdef"), true);
+    chkb(io, st, "match-no", regex::isMatch("bc", "abc"), false);
+    chkb(io, st, "full-yes", regex::fullMatch("a.c", "abc"), true);
+    chkb(io, st, "full-no", regex::fullMatch("a.c", "abcd"), false);
+    chkb(io, st, "search", regex::search("bc", "abcd"), true);
+    chkb(io, st, "search-no", regex::search("z", "abcd"), false);
+
+    chks(io, st, "find-digits", regex::find("[0-9]+", "id=42, n=7"), "42");
+    all List<String> = regex::findAll("[0-9]+", "id=42, n=7");
+    chki(io, st, "findAll-count", all.size(), 2);
+    chks(io, st, "findAll-0", all[0], "42");
+    chks(io, st, "findAll-1", all[1], "7");
+
+    g List<String> = regex::groups("(\\w+)@(\\w+)\\.(\\w+)", "user@mail.com");
+    chki(io, st, "groups-size", g.size(), 4);
+    chks(io, st, "groups-0", g[0], "user@mail.com");
+    chks(io, st, "groups-1", g[1], "user");
+    chks(io, st, "groups-3", g[3], "com");
+
+    chkb(io, st, "anchor", regex::isMatch("^a.*z$", "abcz"), true);
+    chkb(io, st, "anchor-no", regex::isMatch("^b", "ab"), false);
+
+    w List<String> = regex::findAll("\\w+", "中文 abc 12");
+    chki(io, st, "word-count", w.size(), 2);
+    chks(io, st, "word-ascii", w[0], "abc");
+
+    chks(io, st, "replace-group", regex::replace("(\\w+)@(\\w+)", "u@h", "$2/$1"), "h/u");
+    chks(io, st, "replace-all", regex::replace("o", "foo", "0"), "f00");
+    chks(io, st, "replace-zw", regex::replace("x*", "abc", "-"), "-a-b-c-");
+
+    sp List<String> = regex::split("\\s*,\\s*", "a, b ,c");
+    chki(io, st, "split-count", sp.size(), 3);
+    chks(io, st, "split-1", sp[1], "b");
+
+    chkb(io, st, "rep-ok", regex::fullMatch("a{2,3}", "aaa"), true);
+    chkb(io, st, "rep-no", regex::fullMatch("a{2,3}", "aaaa"), false);
+    chkb(io, st, "rep-open", regex::fullMatch("a{2,}", "aaaaa"), true);
+    chkb(io, st, "rep-exact", regex::fullMatch("a{3}", "aaa"), true);
+    chkb(io, st, "rep-zero", regex::fullMatch("a{0}b", "b"), true);
+
+    chks(io, st, "lazy", regex::find("a+?", "aaa"), "a");
+    chks(io, st, "greedy", regex::find("a+", "aaa"), "aaa");
+    chks(io, st, "lazy-star", regex::find("<.*?>", "<a><b>"), "<a>");
+    chks(io, st, "greedy-star", regex::find("<.*>", "<a><b>"), "<a><b>");
+
+    chkb(io, st, "wordb", regex::isMatch("\\bfoo\\b", "foo bar"), true);
+    chkb(io, st, "wordb-no", regex::search("\\bfoo\\b", "xfoo"), false);
+    chkb(io, st, "nwordb", regex::search("\\Bfoo", "xfoo"), true);
+
+    chks(io, st, "neg-class", regex::find("[^0-9]+", "12abc34"), "abc");
+    esc String = regex::escape("a.b*c");
+    chks(io, st, "escape", esc, "a\\.b\\*c");
+    chkb(io, st, "escape-match", regex::fullMatch(esc, "a.b*c"), true);
+
+    chks(io, st, "dot-cn", regex::find(".", "中文"), "中");
+    chkb(io, st, "noncap", regex::fullMatch("(?:\\d+)-(\\d+)", "12-34"), true);
+    ng List<String> = regex::groups("(?:\\d+)-(\\d+)", "12-34");
+    chki(io, st, "noncap-groups", ng.size(), 2);
+    chks(io, st, "noncap-g2", ng[1], "34");
+
+    zw List<String> = regex::findAll("a*", "aab");
+    chki(io, st, "zw-count", zw.size(), 3);
+    chks(io, st, "zw-0", zw[0], "aa");
+    chks(io, st, "zw-1", zw[1], "");
+
+    chkb(io, st, "rep-group", regex::fullMatch("(ab)+", "ababab"), true);
+    chks(io, st, "rep-group-cap", regex::groups("(ab)+", "ababab")[1], "ab");
+
+    cn List<String> = regex::findAll("[一-龥]+", "中文abc汉字");
+    chki(io, st, "cn-count", cn.size(), 2);
+    chks(io, st, "cn-0", cn[0], "中文");
+    chks(io, st, "cn-1", cn[1], "汉字");
+
+    re Regex = regex::compile("abc");
+    chki(io, st, "rune-index", re.indexOf("中文abc"), 2);
+    chki(io, st, "groupCount", regex::compile("(a)(b)").groupCount(), 2);
+    chkb(io, st, "obj-valid", regex::compile("(a").isValid(), false);
+    chkb(io, st, "obj-full", regex::compile("\\d+").fullMatch("123"), true);
+    chks(io, st, "obj-find", regex::compile("[a-z]+").find("12ab34"), "ab");
+    chks(io, st, "lit-unicode", regex::find("汉字", "中文abc汉字"), "汉字");
+    chks(io, st, "replace-first", regex::compile("o").replaceFirst("foo", "0"), "f0o");
+
+    chks(io, st, "alt", regex::find("cat|dog", "a dog here"), "dog");
+    chks(io, st, "alt-first", regex::find("cat|dog", "a cat here"), "cat");
+    chks(io, st, "alt-none", regex::find("cat|dog", "a bird"), "");
+    chks(io, st, "alt-groups", regex::groups("(cat|dog)s?", "dogs")[1], "dog");
+    chkb(io, st, "alt-anchor", regex::fullMatch("^(cat|dog)$", "dog"), true);
+    chks(io, st, "alt-plus", regex::find("(ab|cd)+", "xxabcdab"), "abcdab");
+    chks(io, st, "bt-star", regex::find("a.*b", "a1b2b3b"), "a1b2b3b");
+    chks(io, st, "bt-lazy", regex::find("a.*?b", "a1b2b3b"), "a1b");
+    chkb(io, st, "bt-fail", regex::fullMatch("(a+)+b", "aaac"), false);
+    chks(io, st, "opt-brace", regex::find("ab{0,2}c", "abbc"), "abbc");
+    chks(io, st, "brace-comma", regex::find("a{2,}b", "aaaab"), "aaaab");
+    chks(io, st, "brace-lit", regex::find("a{x}", "za{x}"), "a{x}");
+    chks(io, st, "class-first-rb", regex::find("[]a]+", "x]a]"), "]a]");
+    chks(io, st, "class-dash-end", regex::find("[a-]+", "-a-"), "-a-");
+    chks(io, st, "class-esc", regex::find("[\d]+", "ab12"), "12");
+    chks(io, st, "nested-group", regex::groups("((a)(b))", "ab")[3], "b");
+    chkb(io, st, "empty-pat", regex::fullMatch("", ""), true);
+    chki(io, st, "empty-all", regex::findAll("", "abc").size(), 4);
+    big String = "";
+    k int = 0;
+    while (k < 300) { big = big + "word" + k.toString() + " "; k = k + 1; }
+    chki(io, st, "stress-count", regex::findAll("\\w+", big).size(), 300);
+    chks(io, st, "unicode-class", regex::find("[一-龥]+", "abc中文def"), "中文");
+    chkb(io, st, "disasm-len", regex::compile("a+").disasm().size() > 10, true);
+
+    chks(io, st, "lead-eol", regex::find("a$", "aa"), "a");
+    chkb(io, st, "lead-nwordb", regex::search("\\Bfoo", "xfoo"), true);
+    chks(io, st, "lead-lit2", regex::find("ab", "aab"), "ab");
+    chks(io, st, "lead-plus", regex::find("a+", "baaa"), "aaa");
+    chks(io, st, "lead-word", regex::find("\\w+@\\w+", " ab@cd"), "ab@cd");
+    chks(io, st, "lead-digit", regex::find("[0-9]+", "x12y34"), "12");
+    chks(io, st, "lead-brace", regex::find("\\d{2}", "1 23 45"), "23");
+    chks(io, st, "lead-lazy", regex::find("a+?", "aaa"), "a");
+    chks(io, st, "lead-star", regex::find("\\w*", "ab cd"), "ab");
+    chki(io, st, "lead-all", regex::findAll("[0-9]+", "a1b22c333").size(), 3);
+    chks(io, st, "lead-replace", regex::replace("[0-9]+", "a1b22c333", "#"), "a#b#c#");
+    chki(io, st, "lead-split", regex::split("[0-9]+", "a1b22c333").size(), 4);
+    g4 List<String> = regex::groups("(\\w+)@(\\w+)\\.(\\w+)", " mail: ab@cd.ef;");
+    chks(io, st, "lead-groupfull", g4[0], "ab@cd.ef");
+    chks(io, st, "lead-g2", g4[2], "cd");
+    chks(io, st, "lead-dot", regex::find(".*b", "aXbYb"), "aXbYb");
+    chks(io, st, "lead-dotlazy", regex::find(".*?b", "aXbYb"), "aXb");
+
+    io.println("failures=" + st[0].toString());
+}
