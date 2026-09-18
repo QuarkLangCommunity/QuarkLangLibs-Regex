@@ -1,0 +1,65 @@
+program main;
+import "regex";
+
+/* 正则后端基准：同一份文本、同一批模式，比较「纯 qk 引擎」与「PCRE2 后端」。
+ * 用法：quark tests/bench_regex.qk [迭代数]
+ * 输出：每个场景的耗时（ms）与匹配计数（便于确认结果一致）。 */
+
+// clock() 返回微秒（int）。
+fn nowUs() int { return clock(); }
+
+fn buildText(int words) String {
+    String s = "";
+    int i = 0;
+    while (i < words) {
+        s = s + "word" + i.toString() + " alpha" + (i % 7).toString() + " ";
+        i = i + 1;
+    }
+    return s;
+}
+
+fn main(IOStream io, HashTable<String, String> env, List<String> args) void {
+    int n = 50;
+    if (args.size() >= 1) { n = args[0].toInt(); }
+    String text = buildText(300);
+
+    // 场景 1：对象式（编译一次）重复搜索
+    Regex reW = regex::compile("\\w+");
+    Regex reN = regex::compile("[0-9]+");
+    Regex reG = regex::compile("(\\w+)@(\\w+)");
+    int t0 = nowUs();
+    int acc = 0;
+    int i = 0;
+    while (i < n) {
+        acc = acc + reW.findAll(text).size();
+        acc = acc + reN.findAll(text).size();
+        if (reG.hasMatch("user@host")) { acc = acc + 1; }
+        i = i + 1;
+    }
+    int t1 = nowUs();
+    io.println("对象式 x", n, ": ", (t1 - t0) / 1000, "ms  checksum=", acc);
+
+    // 场景 2：模式式（每次编译，常见用法）
+    int t2 = nowUs();
+    int acc2 = 0;
+    i = 0;
+    while (i < n) {
+        acc2 = acc2 + regex::findAll("\\w+", text).size();
+        acc2 = acc2 + regex::findAll("[0-9]+", text).size();
+        if (regex::search("(\\w+)@(\\w+)", "user@host")) { acc2 = acc2 + 1; }
+        i = i + 1;
+    }
+    int t3 = nowUs();
+    io.println("模式式 x", n, ": ", (t3 - t2) / 1000, "ms  checksum=", acc2);
+
+    // 场景 3：替换（含组引用展开）
+    int t4 = nowUs();
+    String out = "";
+    i = 0;
+    while (i < n) {
+        out = regex::replace("(\\w+)@(\\w+)", "mail user@host now", "$2/$1");
+        i = i + 1;
+    }
+    int t5 = nowUs();
+    io.println("替换 x", n, ": ", (t5 - t4) / 1000, "ms  last=", out);
+}

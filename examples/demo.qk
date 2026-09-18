@@ -4,20 +4,20 @@
 program main;
 import "regex";
 
-fn main(io IOStream) {
-    text String = "";
+fn main(IOStream io) {
+    String text = "";
     text = text + "[2026-09-13 08:00:01] INFO  user=alice ip=10.0.0.7 status=200\n";
     text = text + "[2026-09-13 08:00:02] ERROR user=bob ip=10.0.0.9 status=500\n";
     text = text + "[2026-09-13 08:00:03] INFO  user=carol ip=10.0.0.8 status=404\n";
 
     // 1) 一次编译，多次复用
-    line Regex = regex::compile("^\\[(.*?)\\]\\s+(\\w+)\\s+user=(\\w+)\\s+ip=([0-9.]+)\\s+status=(\\d+)$");
+    Regex line = regex::compile("^\\[(.*?)\\]\\s+(\\w+)\\s+user=(\\w+)\\s+ip=([0-9.]+)\\s+status=(\\d+)$");
 
-    lines List<String> = text.split("\n");
-    i int = 0;
+    List<String> lines = text.split("\n");
+    int i = 0;
     io.println("== 全部请求 ==");
     while (i < lines.size()) {
-        g List<String> = line.findGroups(lines[i]);
+        List<String> g = line.findGroups(lines[i]);
         if (g.size() > 0) {
             io.println(g[1] + " [" + g[2] + "] " + g[3] + "@" + g[4] + " -> " + g[5]);
         }
@@ -34,7 +34,7 @@ fn main(io IOStream) {
 
     // 4) 抽取所有 IP
     io.println("== IP 列表 ==");
-    ips List<String> = regex::findAll("\\d+\\.\\d+\\.\\d+\\.\\d+", text);
-    j int = 0;
+    List<String> ips = regex::findAll("\\d+\\.\\d+\\.\\d+\\.\\d+", text);
+    int j = 0;
     while (j < ips.size()) { io.println("  " + ips[j]); j = j + 1; }
 }

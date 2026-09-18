@@ -1,0 +1,226 @@
+/* QuarkLang 官方库：regex（PCRE2 后端）—— 与 regex.qk 同 API，把匹配交给 C 库
+ *
+ * 定位：把「正则匹配」这个性能服务托管给系统 PCRE2（libpcre2-8），
+ *       回溯/量词/字符类/UTF-8 全部由 C 侧完成；本文件只保留与纯 qk 引擎一致的
+ *       语义外壳（锚定方式、空匹配推进、$N 替换展开、split 切分规则）。
+ *
+ * 构建后端：native/build.sh → bin/libqkregex.so（需系统 libpcre2-8 与 C 编译器）
+ * 运行：LD_LIBRARY_PATH=<本库 bin 目录> quark <程序>.qk
+ *
+ * 与纯 qk 引擎的差异：
+ *   - 支持范围**以纯 qk 引擎为上限**：反向引用 \1、前后瞻 (?=...)、内联标志 (?i) 一律视为无效模式
+ *     （isValid=false），保证两个后端对同一模式给出相同判定；
+ *   - 主题必须是合法 UTF-8（PCRE2 UTF 模式校验）：非法字节会导致匹配失败，而纯 qk 引擎按 rune 容错。
+ */
+program library;
+
+library qkregex {
+    fn qk_re_compile(String pat) pointer;
+    fn qk_re_ok(pointer re) int;
+    fn qk_re_groups(pointer re) int;
+    fn qk_re_set_subject(pointer re, String s) int;
+    fn qk_re_match_at(pointer re, int start, int anchored, int endanchored) int;
+    fn qk_re_gstart(pointer re, int i) int;
+    fn qk_re_gend(pointer re, int i) int;
+    fn qk_re_rune_of_byte(pointer re, int byteoff) int;
+    fn qk_re_byte_of_rune(pointer re, int runeoff) int;
+    fn qk_re_free(pointer re) void;
+}
+
+type struct {
+    pointer h;
+    bool ok;
+    int ngroups;
+} Regex;
+
+impl {
+    // 纯 qk 引擎不支持的特性（判定口径与它一致）：反向引用 / 前后瞻 / 内联标志
+    fn supported(String pat) bool {
+        int i = 0;
+        while (i < pat.size()) {
+            String c = pat.charAt(i);
+            if (c == "\\") {
+                String d = "";
+                if (i + 1 < pat.size()) { d = pat.charAt(i + 1); }
+                if ("123456789".indexOf(d) >= 0) { return false; }
+                i = i + 2;
+            } else {
+                if (c == "(") {
+                    String d2 = "";
+                    if (i + 1 < pat.size()) { d2 = pat.charAt(i + 1); }
+                    if (d2 == "?") {
+                        String d3 = "";
+                        if (i + 2 < pat.size()) { d3 = pat.charAt(i + 2); }
+                        if (d3 != ":") { return false; } // (?: 支持；其余 (?= (?! (?< (?i 等不支持）
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        return true;
+    }
+    fn new(String pat) Regex {
+        Regex r;
+        r.h = null;
+        r.ok = false;
+        r.ngroups = 0;
+        if (!Regex::supported(pat)) { return r; }
+        r.h = qkregex.qk_re_compile(pat);
+        if (r.h == null) { return r; }
+        if (qkregex.qk_re_ok(r.h) != 0) { r.ok = true; }
+        r.ngroups = qkregex.qk_re_groups(r.h);
+        return r;
+    }
+    fn isValid(Regex self) bool { return self.ok; }
+    fn groupCount(Regex self) int { return self.ngroups; }
+    // 纯 qk 引擎的 disasm() 暴露它自己的字节码；PCRE2 后端没有等价物，
+    // 这里返回后端描述（测试只校验「有可读摘要」，两后端同签名）。
+    fn disasm(Regex self) String {
+        return "pcre2 backend ok=" + self.ok.toString() + " groups=" + self.ngroups.toString();
+    }
+
+    // ---- 内部：设主题 + 匹配（rune 起点）----
+    fn run(Regex self, String s, int runeStart, int anchored, int endanchored) bool {
+        if (!self.ok) { return false; }
+        qkregex.qk_re_set_subject(self.h, s);
+        int b = qkregex.qk_re_byte_of_rune(self.h, runeStart);
+        return qkregex.qk_re_match_at(self.h, b, anchored, endanchored) != 0;
+    }
+    fn gStart(Regex self) int { return qkregex.qk_re_rune_of_byte(self.h, qkregex.qk_re_gstart(self.h, 0)); }
+    fn gEnd(Regex self) int { return qkregex.qk_re_rune_of_byte(self.h, qkregex.qk_re_gend(self.h, 0)); }
+    fn groupText(Regex self, String s, int g) String {
+        int bs = qkregex.qk_re_gstart(self.h, g);
+        if (bs < 0) { return ""; }
+        int be = qkregex.qk_re_gend(self.h, g);
+        if (be < bs) { return ""; }
+        return s.substring(qkregex.qk_re_rune_of_byte(self.h, bs), qkregex.qk_re_rune_of_byte(self.h, be));
+    }
+    fn isMatch(Regex self, String s) bool { return self.run(s, 0, 1, 0); }
+    fn fullMatch(Regex self, String s) bool { return self.run(s, 0, 1, 1); }
+    fn hasMatch(Regex self, String s) bool { return self.run(s, 0, 0, 0); }
+    fn indexOf(Regex self, String s) int {
+        if (!self.run(s, 0, 0, 0)) { return -1; }
+        return self.gStart();
+    }
+    fn find(Regex self, String s) String {
+        if (!self.run(s, 0, 0, 0)) { return ""; }
+        return s.substring(self.gStart(), self.gEnd());
+    }
+    fn findAll(Regex self, String s) List<String> {
+        List<String> out = [];
+        if (!self.ok) { return out; }
+        qkregex.qk_re_set_subject(self.h, s);
+        int n = s.size();
+        int pos = 0;
+        while (pos <= n) {
+            int b = qkregex.qk_re_byte_of_rune(self.h, pos);
+            if (qkregex.qk_re_match_at(self.h, b, 0, 0) == 0) { break; }
+            int a = self.gStart();
+            int e = self.gEnd();
+            out.append(s.substring(a, e));
+            if (e > a) { pos = e; } else { pos = a + 1; }
+        }
+        return out;
+    }
+    fn findGroups(Regex self, String s) List<String> {
+        List<String> out = [];
+        if (!self.run(s, 0, 0, 0)) { return out; }
+        int g = 0;
+        while (g <= self.ngroups) {
+            out.append(self.groupText(s, g));
+            g = g + 1;
+        }
+        return out;
+    }
+    fn isDigitC(String d) bool { return "0123456789".indexOf(d) >= 0; }
+    // 替换展开：$0..$9 组引用、$$ 字面 $、\\ 字面 \（与纯 qk 引擎一致）
+    fn expand(Regex self, String s, String repl) String {
+        String out = "";
+        int i = 0;
+        while (i < repl.size()) {
+            String c = repl.charAt(i);
+            if (c == "$" || c == "\\") {
+                String d = "";
+                if (i + 1 < repl.size()) { d = repl.charAt(i + 1); }
+                if (d == "$" || d == "\\") { out = out + d; i = i + 2; }
+                else if (Regex::isDigitC(d)) { out = out + self.groupText(s, "0123456789".indexOf(d)); i = i + 2; }
+                else { out = out + c; i = i + 1; }
+            } else { out = out + c; i = i + 1; }
+        }
+        return out;
+    }
+    fn replaceFirst(Regex self, String s, String repl) String {
+        if (!self.run(s, 0, 0, 0)) { return s; }
+        int a = self.gStart();
+        int e = self.gEnd();
+        String exp = self.expand(s, repl);
+        return s.substring(0, a) + exp + s.substring(e);
+    }
+    fn replace(Regex self, String s, String repl) String {
+        String out = "";
+        if (!self.ok) { return s; }
+        qkregex.qk_re_set_subject(self.h, s);
+        int n = s.size();
+        int pos = 0;
+        while (pos <= n) {
+            int b = qkregex.qk_re_byte_of_rune(self.h, pos);
+            if (qkregex.qk_re_match_at(self.h, b, 0, 0) == 0) { break; }
+            int a = self.gStart();
+            int e = self.gEnd();
+            String exp = self.expand(s, repl);
+            out = out + s.substring(pos, a) + exp;
+            if (e > a) { pos = e; }
+            else {
+                if (a < n) { out = out + s.charAt(a); }
+                pos = a + 1;
+            }
+        }
+        if (pos <= n) { out = out + s.substring(pos, n); }
+        return out;
+    }
+    fn split(Regex self, String s) List<String> {
+        List<String> out = [];
+        if (!self.ok) { return out; }
+        qkregex.qk_re_set_subject(self.h, s);
+        int n = s.size();
+        int pos = 0;
+        while (pos <= n) {
+            int b = qkregex.qk_re_byte_of_rune(self.h, pos);
+            if (qkregex.qk_re_match_at(self.h, b, 0, 0) == 0) { break; }
+            int a = self.gStart();
+            int e = self.gEnd();
+            out.append(s.substring(pos, a));
+            if (e > a) { pos = e; }
+            else {
+                if (a < n) { out.append(s.charAt(a)); }
+                pos = a + 1;
+            }
+        }
+        if (pos <= n) { out.append(s.substring(pos, n)); }
+        return out;
+    }
+} Regex;
+
+space {
+    fn compile(String pat) Regex { return Regex::new(pat); }
+    fn isValid(String pat) bool { Regex r = Regex::new(pat); return r.isValid(); }
+    fn isMatch(String pat, String s) bool { Regex r = Regex::new(pat); return r.isMatch(s); }
+    fn fullMatch(String pat, String s) bool { Regex r = Regex::new(pat); return r.fullMatch(s); }
+    fn search(String pat, String s) bool { Regex r = Regex::new(pat); return r.hasMatch(s); }
+    fn find(String pat, String s) String { Regex r = Regex::new(pat); return r.find(s); }
+    fn findAll(String pat, String s) List<String> { Regex r = Regex::new(pat); return r.findAll(s); }
+    fn groups(String pat, String s) List<String> { Regex r = Regex::new(pat); return r.findGroups(s); }
+    fn replace(String pat, String s, String repl) String { Regex r = Regex::new(pat); return r.replace(s, repl); }
+    fn split(String pat, String s) List<String> { Regex r = Regex::new(pat); return r.split(s); }
+    fn escape(String s) String {
+        String out = "";
+        int i = 0;
+        while (i < s.size()) {
+            String c = s.charAt(i);
+            if ("\\.^$*+?()[]{}|".indexOf(c) >= 0) { out = out + "\\" + c; }
+            else { out = out + c; }
+            i = i + 1;
+        }
+        return out;
+    }
+} regex;
